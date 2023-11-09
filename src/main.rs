@@ -1,6 +1,6 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration, convert::Infallible};
 
-use anyhow::Context;
+use anyhow::{Context, anyhow};
 use axum::{
     http::StatusCode,
     routing::{get, post},
@@ -91,6 +91,7 @@ async fn main() -> anyhow::Result<()> {
     let routing_table = Box::leak(Box::new(routing::RoutingTable::new(
         std::env::var("QUICLIME_BASE_DOMAIN").context("Reading QUICLIME_BASE_DOMAIN")?,
     )));
+    #[allow(unreachable_code)]
     tokio::try_join!(
         listen_quic(endpoint, routing_table),
         listen_control(endpoint, routing_table),
@@ -183,17 +184,17 @@ async fn handle_quic(connection: Connecting, routing_table: &RoutingTable) {
 async fn listen_quic(
     endpoint: &'static Endpoint,
     routing_table: &'static RoutingTable,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Infallible> {
     while let Some(connection) = endpoint.accept().await {
         tokio::spawn(handle_quic(connection, routing_table));
     }
-    Ok(())
+    Err(anyhow!("quiclime endpoint closed"))
 }
 
 async fn listen_control(
     endpoint: &'static Endpoint,
     routing_table: &'static RoutingTable,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Infallible> {
     let app = axum::Router::new()
         .route(
             "/metrics",
@@ -228,7 +229,7 @@ async fn listen_control(
     )
     .serve(app.into_make_service())
     .await?;
-    Ok(())
+    Err(anyhow!("control endpoint closed"))
 }
 
 async fn try_handle_minecraft(
@@ -298,15 +299,19 @@ async fn handle_minecraft(connection: TcpStream, routing_table: &'static Routing
     };
 }
 
-async fn listen_minecraft(routing_table: &'static RoutingTable) -> anyhow::Result<()> {
+async fn listen_minecraft(routing_table: &'static RoutingTable) -> anyhow::Result<Infallible> {
     let server = tokio::net::TcpListener::bind(
         std::env::var("QUICLIME_BIND_ADDR_MC")
             .context("Reading QUICLIME_BIND_ADDR_MC")?
             .parse::<SocketAddr>()?,
     )
     .await?;
-    while let Ok((connection, _)) = server.accept().await {
-        tokio::spawn(handle_minecraft(connection, routing_table));
+    loop {
+        match server.accept().await {
+            Ok((connection, _)) => { tokio::spawn(handle_minecraft(connection, routing_table)); },
+            Err(e) => {
+                error!("Error accepting minecraft connection: {}", e);
+            },
+        }
     }
-    Ok(())
 }
