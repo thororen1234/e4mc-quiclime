@@ -28,7 +28,7 @@
           path = ./.;
         };
 
-        cargoSha256 = "sha256-pc3uVPimdjygDHEludRByy7mbXJr//rCf7OfrsW+hDk=";
+        cargoSha256 = "sha256-JTGF9HeEUkj7GWVFz+x4NHhSwEqGqvFShGJSBohDfyM=";
       };
   in rec {
     packages = forAllSystems (s: let
