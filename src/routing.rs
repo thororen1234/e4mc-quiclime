@@ -17,6 +17,7 @@ pub enum RouterRequest {
 type RouterCallback = oneshot::Sender<(SendStream, RecvStream)>;
 type RouteRequestReceiver = mpsc::UnboundedSender<RouterRequest>;
 
+#[allow(clippy::module_name_repetitions)]
 #[derive(Default)]
 pub struct RoutingTable {
     table: RwLock<HashMap<String, RouteRequestReceiver>>,
@@ -26,7 +27,7 @@ pub struct RoutingTable {
 impl RoutingTable {
     pub fn new(base_domain: String) -> Self {
         RoutingTable {
-            table: Default::default(),
+            table: RwLock::default(),
             base_domain,
         }
     }
@@ -53,7 +54,7 @@ impl RoutingTable {
         recv.await.ok()
     }
 
-    pub async fn register(&self) -> RoutingHandle {
+    pub fn register(&self) -> RoutingHandle {
         let mut lock = self.table.write();
         let mut domain = format!(
             "{}-{}.{}",
@@ -93,6 +94,7 @@ impl RoutingTable {
     }
 }
 
+#[allow(clippy::module_name_repetitions)]
 pub struct RoutingHandle<'a> {
     recv: mpsc::UnboundedReceiver<RouterRequest>,
     domain: String,
