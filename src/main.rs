@@ -273,6 +273,12 @@ async fn politely_disconnect(
 ) -> anyhow::Result<()> {
     match handshake.next_state {
         netty::HandshakeType::Status => {
+            let packet = netty::read_packet(&mut connection).await?;
+            let mut packet = packet.as_slice();
+            let id = packet.read_varint()?;
+            if id != 0 {
+                return Err(anyhow!("Packet isn't a Status Request(0x00), but {:#04x}", id));
+            }
             let mut buf = vec![];
             buf.write_varint(0).await?;
             buf.write_string(include_str!("./serverlistping_response.json"))
