@@ -28,7 +28,9 @@
           path = ./.;
         };
 
-        cargoSha256 = "sha256-JTGF9HeEUkj7GWVFz+x4NHhSwEqGqvFShGJSBohDfyM=";
+        cargoLock = {
+          lockFile = ./Cargo.lock;
+        };
       };
   in rec {
     packages = forAllSystems (s: let
