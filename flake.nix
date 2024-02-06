@@ -125,6 +125,7 @@
               Group = cfg.group;
               ExecStart =
                 "${cfg.package}/bin/quiclime";
+              Restart = "on-failure";
             };
 
             environment = {
