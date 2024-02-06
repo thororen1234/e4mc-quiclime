@@ -16,7 +16,7 @@ use tokio::{
 };
 
 use crate::{
-    netty::WriteExtNetty,
+    netty::{WriteExtNetty, ReadExtNetty},
     proto::{ClientboundControlMessage, ServerboundControlMessage},
 };
 
@@ -277,6 +277,18 @@ async fn politely_disconnect(
             buf.write_varint(0).await?;
             buf.write_string(include_str!("./serverlistping_response.json"))
                 .await?;
+            connection.write_varint(buf.len() as i32).await?;
+            connection.write_all(&buf).await?;
+            let packet = netty::read_packet(&mut connection).await?;
+            let mut packet = packet.as_slice();
+            let id = packet.read_varint()?;
+            if id != 1 {
+                return Err(anyhow!("Packet isn't a Ping Request(0x01), but {:#04x}", id));
+            }
+            let payload = packet.read_long()?;
+            let mut buf = Vec::with_capacity(1 + 8);
+            buf.write_varint(1).await?;
+            buf.write_u64(payload).await?;
             connection.write_varint(buf.len() as i32).await?;
             connection.write_all(&buf).await?;
         }

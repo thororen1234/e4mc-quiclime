@@ -39,6 +39,12 @@ pub trait ReadExtNetty: Read {
         Ok(u16::from_be_bytes(buf))
     }
 
+    fn read_long(&mut self) -> Result<u64, NettyReadError> {
+        let mut buf = [0u8; 8];
+        self.read_exact(&mut buf)?;
+        Ok(u64::from_be_bytes(buf))
+    }
+
     fn read_string(&mut self) -> Result<String, NettyReadError> {
         let len = self.read_varint()?;
         let mut buf = vec![0u8; len as usize];
