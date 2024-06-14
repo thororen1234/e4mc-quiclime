@@ -4,9 +4,8 @@ use std::io::Read;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use log::error;
 use thiserror::Error;
-use eyre as anyhow;
+use tracing::error;
 
 #[derive(Error, Debug)]
 pub enum ReadError {
@@ -155,10 +154,10 @@ pub enum HandshakeType {
 }
 
 impl Handshake {
-    pub fn new(mut packet: &[u8]) -> anyhow::Result<Self> {
+    pub fn new(mut packet: &[u8]) -> eyre::Result<Self> {
         let packet_type = packet.read_varint()?;
         if packet_type != 0 {
-            Err(anyhow::anyhow!("Not a Handshake packet"))
+            Err(eyre::eyre!("Not a Handshake packet"))
         } else {
             let protocol_version = packet.read_varint()?;
             let server_address = packet.read_string()?;
@@ -166,7 +165,7 @@ impl Handshake {
             let next_state = match packet.read_varint()? {
                 1 => HandshakeType::Status,
                 2 => HandshakeType::Login,
-                _ => return Err(anyhow::anyhow!("Invalid next state")),
+                _ => return Err(eyre::eyre!("Invalid next state")),
             };
             Ok(Self {
                 protocol_version,
