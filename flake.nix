@@ -31,6 +31,8 @@
         cargoLock = {
           lockFile = ./Cargo.lock;
         };
+
+        separateDebugInfo = true;
       };
   in rec {
     packages = forAllSystems (s: let
