@@ -113,6 +113,12 @@
               example = "/path/to/key.pem";
               description = lib.mdDoc "Path to TLS key to use for quiclime connections.";
             };
+
+            sentryDsn = mkOption {
+              type = types.str;
+              example = "https://key@sentry.io/42";
+              description = lib.mdDoc "Sentry DSN to use for error reports.";
+            };
           };
         };
 
@@ -137,6 +143,7 @@
               QUICLIME_BIND_ADDR_WEB = cfg.controlAddr;
               QUICLIME_CERT_PATH = cfg.cert;
               QUICLIME_KEY_PATH = cfg.key;
+              SENTRY_DSN = cfg.sentryDsn;
             };
           };
 

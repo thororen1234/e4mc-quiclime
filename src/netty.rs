@@ -4,9 +4,9 @@ use std::io::Read;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use async_trait::async_trait;
 use log::error;
 use thiserror::Error;
+use eyre as anyhow;
 
 #[derive(Error, Debug)]
 pub enum ReadError {
@@ -119,7 +119,6 @@ async fn read_varint(mut reader: impl AsyncReadExt + Unpin) -> Result<i32, ReadE
 
 impl<T: Read> ReadExt for T {}
 
-#[async_trait]
 pub trait WriteExt: AsyncWriteExt + Unpin {
     async fn write_varint(&mut self, mut val: i32) -> std::io::Result<()> {
         for _ in 0..5 {
