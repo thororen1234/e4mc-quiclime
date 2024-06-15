@@ -89,6 +89,7 @@ async fn main() -> eyre::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .with(sentry_tracing::layer())
         .init();
+    rustls::crypto::aws_lc_rs::default_provider().install_default().unwrap();
     // JUSTIFICATION: this lives until the end of the entire program
     let endpoint = Box::leak(Box::new(Endpoint::server(
         create_server_config().await?,
