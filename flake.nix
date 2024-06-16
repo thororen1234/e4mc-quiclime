@@ -128,6 +128,7 @@
           systemd.services.quiclime = {
             wantedBy = [ "multi-user.target" ];
             after = [ "network-online.target" ];
+            wants = [ "network-online.target" ];
             description = "Quiclime relay server";
             serviceConfig = {
               Type = "simple";
@@ -136,6 +137,7 @@
               ExecStart =
                 "${cfg.package}/bin/quiclime";
               Restart = "on-failure";
+              LimitNOFILE = "infinity";
             };
 
             environment = {
