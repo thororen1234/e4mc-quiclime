@@ -4,7 +4,7 @@
 
 use std::{convert::Infallible, net::SocketAddr, sync::Arc, time::Duration};
 
-use eyre::{anyhow, Context, self as anyhow};
+use anyhow::{anyhow, Context};
 use axum::{
     http::StatusCode,
     routing::{get, post},
@@ -85,7 +85,6 @@ async fn create_server_config() -> anyhow::Result<ServerConfig> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let _guard = sentry::init(std::env::var("SENTRY_DSN").ok());
     env_logger::init();
     // JUSTIFICATION: this lives until the end of the entire program
     let endpoint = Box::leak(Box::new(Endpoint::server(
@@ -104,7 +103,6 @@ async fn main() -> anyhow::Result<()> {
         listen_control(endpoint, routing_table),
         listen_minecraft(routing_table)
     )?;
-    drop(_guard);
     Ok(())
 }
 
@@ -184,7 +182,6 @@ async fn try_handle_quic(
 
 async fn handle_quic(connection: Connecting, routing_table: &RoutingTable) {
     if let Err(e) = try_handle_quic(connection, routing_table).await {
-        sentry::capture_error::<dyn std::error::Error>(e.as_ref());
         error!("Error handling QUIClime connection: {}", e);
     };
     info!("Finished handling QUIClime connection");
@@ -228,9 +225,6 @@ async fn listen_control(
         .route(
             "/stop",
             post(|| async {
-                endpoint.reject_new_connections();
-                routing_table.broadcast("e4mc relay server stopping!");
-                tokio::time::sleep(Duration::from_secs(1)).await;
                 endpoint.close(0u32.into(), b"e4mc closing");
             }),
         );
@@ -265,8 +259,11 @@ async fn try_handle_minecraft(
         return politely_disconnect(connection, handshake).await;
     };
     handshake.send(&mut send_host).await?;
-    let mut conn_host = tokio::io::join(&mut recv_host, &mut send_host);
-    _ = tokio::io::copy_bidirectional(&mut connection, &mut conn_host);
+    let (mut recv_client, mut send_client) = connection.split();
+    tokio::select! {
+        _ = tokio::io::copy(&mut recv_client, &mut send_host) => (),
+        _ = tokio::io::copy(&mut recv_host, &mut send_client) => ()
+    }
     _ = connection.shutdown().await;
     _ = send_host.finish().await;
     _ = recv_host.stop(0u32.into());
@@ -326,8 +323,7 @@ async fn politely_disconnect(
 
 async fn handle_minecraft(connection: TcpStream, routing_table: &'static RoutingTable) {
     if let Err(e) = try_handle_minecraft(connection, routing_table).await {
-        sentry::capture_error::<dyn std::error::Error>(e.as_ref());
-        error!("Error handling Minecraft connection: {:#}", e);
+        error!("Error handling Minecraft connection: {}", e.backtrace());
     };
 }
 
@@ -344,7 +340,6 @@ async fn listen_minecraft(routing_table: &'static RoutingTable) -> anyhow::Resul
                 tokio::spawn(handle_minecraft(connection, routing_table));
             }
             Err(e) => {
-                sentry::capture_error(&e);
                 error!("Error accepting minecraft connection: {}", e);
             }
         }
