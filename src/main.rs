@@ -2,30 +2,22 @@
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::cast_possible_wrap)]
 
-use std::{
-    convert::Infallible,
-    net::SocketAddr,
-    sync::{atomic::AtomicUsize, Arc},
-    time::Duration,
-};
+use std::{convert::Infallible, net::SocketAddr, sync::Arc, time::Duration};
 
+use eyre::{anyhow, Context, self as anyhow};
 use axum::{
     http::StatusCode,
     routing::{get, post},
 };
-use eyre::{eyre, OptionExt, WrapErr};
+use log::{error, info};
 use netty::{Handshake, ReadError};
-use quinn::{
-    crypto::rustls::QuicServerConfig, ConnectionError, Endpoint, Incoming, ServerConfig,
-    TransportConfig,
-};
+use quinn::{Connecting, ConnectionError, Endpoint, ServerConfig, TransportConfig};
 use routing::RoutingTable;
+use rustls::{Certificate, PrivateKey};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::TcpStream,
 };
-use tracing::{error, info};
-use tracing_subscriber::prelude::*;
 
 use crate::{
     netty::{ReadExt, WriteExt},
@@ -38,24 +30,50 @@ mod routing;
 mod unicode_madness;
 mod wordlist;
 
-async fn create_server_config() -> eyre::Result<ServerConfig> {
-    let cert_file =
-        tokio::fs::read(std::env::var("QUICLIME_CERT_PATH").context("Reading QUICLIME_CERT_PATH")?)
-            .await?;
-    let cert_chain = rustls_pemfile::certs(&mut cert_file.as_slice())
-        .filter_map(Result::ok)
+fn any_private_keys(rd: &mut dyn std::io::BufRead) -> Result<Vec<Vec<u8>>, std::io::Error> {
+    let mut keys = Vec::<Vec<u8>>::new();
+
+    loop {
+        match rustls_pemfile::read_one(rd)? {
+            None => return Ok(keys),
+            Some(
+                rustls_pemfile::Item::RSAKey(key)
+                | rustls_pemfile::Item::PKCS8Key(key)
+                | rustls_pemfile::Item::ECKey(key),
+            ) => keys.push(key),
+            _ => {}
+        };
+    }
+}
+
+fn get_certs() -> anyhow::Result<(Vec<Certificate>, PrivateKey)> {
+    let mut cert_file = std::io::BufReader::new(std::fs::File::open(
+        std::env::var("QUICLIME_CERT_PATH").context("Reading QUICLIME_CERT_PATH")?,
+    )?);
+    let certs = rustls_pemfile::certs(&mut cert_file)?
+        .into_iter()
+        .map(Certificate)
         .collect();
-    let key_file =
-        tokio::fs::read(std::env::var("QUICLIME_KEY_PATH").context("Reading QUICLIME_KEY_PATH")?)
-            .await?;
-    let key_der = rustls_pemfile::private_key(&mut key_file.as_slice())?
-        .ok_or_eyre("No private key in QUICLIME_KEY_PATH!")?;
+    let mut key_file = std::io::BufReader::new(std::fs::File::open(
+        std::env::var("QUICLIME_KEY_PATH").context("Reading QUICLIME_KEY_PATH")?,
+    )?);
+    let key = PrivateKey(
+        any_private_keys(&mut key_file)?
+            .into_iter()
+            .next()
+            .ok_or(anyhow::anyhow!("No private key?"))?,
+    );
+    Ok((certs, key))
+}
+
+async fn create_server_config() -> anyhow::Result<ServerConfig> {
+    let (cert_chain, key_der) = tokio::task::spawn_blocking(get_certs).await??;
     let mut rustls_config = rustls::ServerConfig::builder()
+        .with_safe_defaults()
         .with_no_client_auth()
         .with_single_cert(cert_chain, key_der)?;
     rustls_config.alpn_protocols = vec![b"quiclime".to_vec()];
-    let config: QuicServerConfig = rustls_config.try_into()?;
-    let mut config = ServerConfig::with_crypto(Arc::new(config));
+    let mut config = ServerConfig::with_crypto(Arc::new(rustls_config));
     let mut transport = TransportConfig::default();
     transport
         .max_concurrent_bidi_streams(1u32.into())
@@ -65,30 +83,10 @@ async fn create_server_config() -> eyre::Result<ServerConfig> {
     Ok(config)
 }
 
-static CLIENT_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-struct ClientCounterGuard;
-
-impl ClientCounterGuard {
-    fn new() -> Self {
-        CLIENT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Self
-    }
-}
-
-impl Drop for ClientCounterGuard {
-    fn drop(&mut self) {
-        CLIENT_COUNT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
 #[tokio::main]
-async fn main() -> eyre::Result<()> {
+async fn main() -> anyhow::Result<()> {
     let _guard = sentry::init(std::env::var("SENTRY_DSN").ok());
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer())
-        .with(sentry_tracing::layer())
-        .init();
+    env_logger::init();
     // JUSTIFICATION: this lives until the end of the entire program
     let endpoint = Box::leak(Box::new(Endpoint::server(
         create_server_config().await?,
@@ -106,10 +104,14 @@ async fn main() -> eyre::Result<()> {
         listen_control(endpoint, routing_table),
         listen_minecraft(routing_table)
     )?;
+    drop(_guard);
     Ok(())
 }
 
-async fn try_handle_quic(connection: Incoming, routing_table: &RoutingTable) -> eyre::Result<()> {
+async fn try_handle_quic(
+    connection: Connecting,
+    routing_table: &RoutingTable,
+) -> anyhow::Result<()> {
     let connection = connection.await?;
     info!(
         "QUIClime connection established to: {}",
@@ -163,7 +165,7 @@ async fn try_handle_quic(connection: Incoming, routing_table: &RoutingTable) -> 
                         } else if let Err(ConnectionError::ConnectionClosed(_)) = pair {
                             break;
                         }
-                        remote.send(pair?).map_err(|e| eyre!("{:?}", e))?;
+                        remote.send(pair?).map_err(|e| anyhow::anyhow!("{:?}", e))?;
                     }
                     routing::RouterRequest::BroadcastRequest(message) => {
                         let response =
@@ -180,8 +182,7 @@ async fn try_handle_quic(connection: Incoming, routing_table: &RoutingTable) -> 
     }
 }
 
-#[tracing::instrument(skip(routing_table))]
-async fn handle_quic(connection: Incoming, routing_table: &RoutingTable) {
+async fn handle_quic(connection: Connecting, routing_table: &RoutingTable) {
     if let Err(e) = try_handle_quic(connection, routing_table).await {
         sentry::capture_error::<dyn std::error::Error>(e.as_ref());
         error!("Error handling QUIClime connection: {}", e);
@@ -192,27 +193,21 @@ async fn handle_quic(connection: Incoming, routing_table: &RoutingTable) {
 async fn listen_quic(
     endpoint: &'static Endpoint,
     routing_table: &'static RoutingTable,
-) -> eyre::Result<Infallible> {
+) -> anyhow::Result<Infallible> {
     while let Some(connection) = endpoint.accept().await {
         tokio::spawn(handle_quic(connection, routing_table));
     }
-    Err(eyre!("quiclime endpoint closed"))
+    Err(anyhow!("quiclime endpoint closed"))
 }
 
 async fn listen_control(
     endpoint: &'static Endpoint,
     routing_table: &'static RoutingTable,
-) -> eyre::Result<Infallible> {
+) -> anyhow::Result<Infallible> {
     let app = axum::Router::new()
         .route(
             "/metrics",
-            get(|| async {
-                format!(
-                    "host_count {}\nguest_count {}\n",
-                    routing_table.size(),
-                    CLIENT_COUNT.load(std::sync::atomic::Ordering::Relaxed)
-                )
-            }),
+            get(|| async { format!("host_count {}", routing_table.size()) }),
         )
         .route(
             "/reload-certs",
@@ -233,24 +228,26 @@ async fn listen_control(
         .route(
             "/stop",
             post(|| async {
+                endpoint.reject_new_connections();
                 routing_table.broadcast("e4mc relay server stopping!");
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 endpoint.close(0u32.into(), b"e4mc closing");
             }),
         );
-    let listener = TcpListener::bind(
-        std::env::var("QUICLIME_BIND_ADDR_WEB").context("Reading QUICLIME_BIND_ADDR_WEB")?,
+    axum::Server::bind(
+        &std::env::var("QUICLIME_BIND_ADDR_WEB")
+            .context("Reading QUICLIME_BIND_ADDR_WEB")?
+            .parse()?,
     )
+    .serve(app.into_make_service())
     .await?;
-    axum::serve(listener, app).await?;
-    Err(eyre!("control endpoint closed"))
+    Err(anyhow!("control endpoint closed"))
 }
 
 async fn try_handle_minecraft(
     mut connection: TcpStream,
     routing_table: &'static RoutingTable,
-) -> eyre::Result<()> {
-    let guard = ClientCounterGuard::new();
+) -> anyhow::Result<()> {
     let peer = connection.peer_addr()?;
     info!("Minecraft client connected from: {}", peer);
     let handshake = netty::read_packet(&mut connection).await;
@@ -271,21 +268,23 @@ async fn try_handle_minecraft(
     let mut conn_host = tokio::io::join(&mut recv_host, &mut send_host);
     _ = tokio::io::copy_bidirectional(&mut connection, &mut conn_host);
     _ = connection.shutdown().await;
-    _ = send_host.finish();
+    _ = send_host.finish().await;
     _ = recv_host.stop(0u32.into());
     info!("Minecraft client disconnected from: {}", peer);
-    drop(guard);
     Ok(())
 }
 
-async fn politely_disconnect(mut connection: TcpStream, handshake: Handshake) -> eyre::Result<()> {
+async fn politely_disconnect(
+    mut connection: TcpStream,
+    handshake: Handshake,
+) -> anyhow::Result<()> {
     match handshake.next_state {
         netty::HandshakeType::Status => {
             let packet = netty::read_packet(&mut connection).await?;
             let mut packet = packet.as_slice();
             let id = packet.read_varint()?;
             if id != 0 {
-                return Err(eyre!(
+                return Err(anyhow!(
                     "Packet isn't a Status Request(0x00), but {:#04x}",
                     id
                 ));
@@ -300,7 +299,10 @@ async fn politely_disconnect(mut connection: TcpStream, handshake: Handshake) ->
             let mut packet = packet.as_slice();
             let id = packet.read_varint()?;
             if id != 1 {
-                return Err(eyre!("Packet isn't a Ping Request(0x01), but {:#04x}", id));
+                return Err(anyhow!(
+                    "Packet isn't a Ping Request(0x01), but {:#04x}",
+                    id
+                ));
             }
             let payload = packet.read_long()?;
             let mut buf = Vec::with_capacity(1 + 8);
@@ -322,7 +324,6 @@ async fn politely_disconnect(mut connection: TcpStream, handshake: Handshake) ->
     Ok(())
 }
 
-#[tracing::instrument(skip(routing_table))]
 async fn handle_minecraft(connection: TcpStream, routing_table: &'static RoutingTable) {
     if let Err(e) = try_handle_minecraft(connection, routing_table).await {
         sentry::capture_error::<dyn std::error::Error>(e.as_ref());
@@ -330,7 +331,7 @@ async fn handle_minecraft(connection: TcpStream, routing_table: &'static Routing
     };
 }
 
-async fn listen_minecraft(routing_table: &'static RoutingTable) -> eyre::Result<Infallible> {
+async fn listen_minecraft(routing_table: &'static RoutingTable) -> anyhow::Result<Infallible> {
     let server = tokio::net::TcpListener::bind(
         std::env::var("QUICLIME_BIND_ADDR_MC")
             .context("Reading QUICLIME_BIND_ADDR_MC")?

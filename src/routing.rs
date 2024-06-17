@@ -1,3 +1,5 @@
+use log::info;
+use log::warn;
 use parking_lot::RwLock;
 use quinn::RecvStream;
 use quinn::SendStream;
@@ -5,8 +7,6 @@ use rand::prelude::*;
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
-use tracing::info;
-use tracing::warn;
 
 #[derive(Debug)]
 pub enum RouterRequest {
