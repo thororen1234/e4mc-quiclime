@@ -25,7 +25,7 @@ use tokio::{
     net::{TcpListener, TcpStream},
 };
 use tracing::{error, info};
-use tracing_subscriber::{prelude::*, EnvFilter};
+use tracing_subscriber::prelude::*;
 
 use crate::{
     netty::{ReadExt, WriteExt},
@@ -86,7 +86,6 @@ impl Drop for ClientCounterGuard {
 async fn main() -> eyre::Result<()> {
     let _guard = sentry::init(std::env::var("SENTRY_DSN").ok());
     tracing_subscriber::registry()
-        .with(EnvFilter::from_default_env())
         .with(tracing_subscriber::fmt::layer())
         .with(sentry_tracing::layer())
         .init();
