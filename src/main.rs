@@ -253,7 +253,7 @@ async fn try_handle_minecraft(
 async fn politely_disconnect(mut connection: TcpStream, handshake: Handshake) -> eyre::Result<()> {
     match handshake.next_state {
         netty::HandshakeType::Status => {
-            let packet = netty::read_packet(&mut connection, 0).await?;
+            let packet = netty::read_packet(&mut connection, 1).await?;
             let mut packet = packet.as_slice();
             let id = packet.read_varint()?;
             if id != 0 {
@@ -268,7 +268,7 @@ async fn politely_disconnect(mut connection: TcpStream, handshake: Handshake) ->
                 .await?;
             connection.write_varint(buf.len() as i32).await?;
             connection.write_all(&buf).await?;
-            let packet = netty::read_packet(&mut connection, 0).await?;
+            let packet = netty::read_packet(&mut connection, 5).await?;
             let mut packet = packet.as_slice();
             let id = packet.read_varint()?;
             if id != 1 {
