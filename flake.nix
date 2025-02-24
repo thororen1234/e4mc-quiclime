@@ -88,13 +88,13 @@
             
             mcAddr = mkOption {
               type = types.str;
-              default = "0.0.0.0:25565";
+              default = "[::]:25565";
               description = lib.mdDoc "The socket address to listen to Minecraft connections.";
             };
             
             relayAddr = mkOption {
               type = types.str;
-              default = "0.0.0.0:25575";
+              default = "[::]:25575";
               description = lib.mdDoc "The socket address to listen to quiclime connections.";
             };
             
