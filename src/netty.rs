@@ -4,7 +4,6 @@ use std::io::Read;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use async_trait::async_trait;
 use log::error;
 use thiserror::Error;
 
@@ -14,6 +13,8 @@ pub enum ReadError {
     IoError(std::io::Error),
     #[error("Was not a netty packet, but a Legacy ServerListPing")]
     LegacyServerListPing,
+    #[error("Packet was too large")]
+    PacketTooLarge,
 }
 
 impl From<std::io::Error> for ReadError {
@@ -86,8 +87,22 @@ pub trait ReadExt: Read {
     // }
 }
 
-pub async fn read_packet(mut reader: impl AsyncReadExt + Unpin) -> Result<Vec<u8>, ReadError> {
+pub async fn read_packet(mut reader: impl AsyncReadExt + Unpin, max_size: usize) -> Result<Vec<u8>, ReadError> {
     let len = read_varint(&mut reader).await?;
+    if len < 0 || (len as usize) > max_size {
+        return Err(if len == 254 {
+            let mut temp = [0u8];
+            reader.read_exact(&mut temp).await?;
+            if temp[0] == 0xFA {
+                // FE 01 FA: Legacy ServerListPing
+                ReadError::LegacyServerListPing
+            } else {
+                ReadError::PacketTooLarge
+            }
+        } else {
+            ReadError::PacketTooLarge
+        })
+    }
     let mut buf = vec![0u8; len as usize];
     if len == 254 {
         let mut temp = [0u8];
@@ -119,7 +134,6 @@ async fn read_varint(mut reader: impl AsyncReadExt + Unpin) -> Result<i32, ReadE
 
 impl<T: Read> ReadExt for T {}
 
-#[async_trait]
 pub trait WriteExt: AsyncWriteExt + Unpin {
     async fn write_varint(&mut self, mut val: i32) -> std::io::Result<()> {
         for _ in 0..5 {
@@ -156,10 +170,10 @@ pub enum HandshakeType {
 }
 
 impl Handshake {
-    pub fn new(mut packet: &[u8]) -> anyhow::Result<Self> {
+    pub fn new(mut packet: &[u8]) -> eyre::Result<Self> {
         let packet_type = packet.read_varint()?;
         if packet_type != 0 {
-            Err(anyhow::anyhow!("Not a Handshake packet"))
+            Err(eyre::eyre!("Not a Handshake packet"))
         } else {
             let protocol_version = packet.read_varint()?;
             let server_address = packet.read_string()?;
@@ -167,7 +181,7 @@ impl Handshake {
             let next_state = match packet.read_varint()? {
                 1 => HandshakeType::Status,
                 2 => HandshakeType::Login,
-                _ => return Err(anyhow::anyhow!("Invalid next state")),
+                _ => return Err(eyre::eyre!("Invalid next state")),
             };
             Ok(Self {
                 protocol_version,

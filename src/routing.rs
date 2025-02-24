@@ -54,33 +54,24 @@ impl RoutingTable {
         recv.await.ok()
     }
 
+    fn random_domain(&self) -> String {
+        format!(
+            "{}-{}.{}",
+            crate::wordlist::ID_WORDS.choose(&mut rand::rng()).unwrap(),
+            crate::wordlist::ID_WORDS.choose(&mut rand::rng()).unwrap(),
+            self.base_domain
+        )
+    }
+
     pub fn register(&self) -> RoutingHandle {
         let mut lock = self.table.write();
-        let mut domain = format!(
-            "{}-{}.{}",
-            crate::wordlist::ID_WORDS
-                .choose(&mut rand::thread_rng())
-                .unwrap(),
-            crate::wordlist::ID_WORDS
-                .choose(&mut rand::thread_rng())
-                .unwrap(),
-            self.base_domain
-        );
+        let mut domain = self.random_domain();
         while lock.contains_key(&domain) {
             warn!(
                 "Randomly selected domain {} conflicts; trying again",
                 domain
             );
-            domain = format!(
-                "{}-{}.{}",
-                crate::wordlist::ID_WORDS
-                    .choose(&mut rand::thread_rng())
-                    .unwrap(),
-                crate::wordlist::ID_WORDS
-                    .choose(&mut rand::thread_rng())
-                    .unwrap(),
-                self.base_domain
-            );
+            domain = self.random_domain();
         }
         domain = crate::unicode_madness::validate_and_normalize_domain(&domain)
             .expect("Resulting domain is not valid");
