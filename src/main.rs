@@ -9,14 +9,14 @@ use axum::{
     routing::{get, post},
 };
 use eyre::{eyre, Context};
-use log::{error, info};
+use log::{error, info, warn};
 use netty::{Handshake, ReadError};
 use quinn::{
     crypto::rustls::QuicServerConfig,
     rustls::pki_types::{CertificateDer, PrivateKeyDer},
     ConnectionError, Endpoint, Incoming, ServerConfig, TransportConfig,
 };
-use routing::RoutingTable;
+use routing::{RoutingError, RoutingTable};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -233,9 +233,17 @@ async fn try_handle_minecraft(
     let Some(address) = handshake.normalized_address() else {
         return politely_disconnect(connection, handshake).await;
     };
-    let Some((mut send_host, mut recv_host)) = routing_table.route(&address).await else {
-        return politely_disconnect(connection, handshake).await;
-    };
+    let (mut send_host, mut recv_host) =
+        match routing_table.route_limited(&address, peer.ip()).await {
+            Ok(val) => val,
+            Err(RoutingError::InvalidDomain) => {
+                return politely_disconnect(connection, handshake).await;
+            }
+            Err(RoutingError::RateLimited) => {
+                warn!("Connection from {} has been rate limited!", peer);
+                return impolitely_disconnect(connection, handshake).await;
+            }
+        };
     handshake.send(&mut send_host).await?;
     let (mut recv_client, mut send_client) = connection.split();
     tokio::select! {
@@ -286,6 +294,53 @@ async fn politely_disconnect(mut connection: TcpStream, handshake: Handshake) ->
             let mut buf = vec![];
             buf.write_varint(0).await?;
             buf.write_string(include_str!("./disconnect_response.json"))
+                .await?;
+            connection.write_varint(buf.len() as i32).await?;
+            connection.write_all(&buf).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn impolitely_disconnect(
+    mut connection: TcpStream,
+    handshake: Handshake,
+) -> eyre::Result<()> {
+    match handshake.next_state {
+        netty::HandshakeType::Status => {
+            let packet = netty::read_packet(&mut connection, 1).await?;
+            let mut packet = packet.as_slice();
+            let id = packet.read_varint()?;
+            if id != 0 {
+                return Err(eyre!(
+                    "Packet isn't a Status Request(0x00), but {:#04x}",
+                    id
+                ));
+            }
+            let mut buf = vec![];
+            buf.write_varint(0).await?;
+            buf.write_string(include_str!("./serverlistping_response_rate.json"))
+                .await?;
+            connection.write_varint(buf.len() as i32).await?;
+            connection.write_all(&buf).await?;
+            let packet = netty::read_packet(&mut connection, 9).await?;
+            let mut packet = packet.as_slice();
+            let id = packet.read_varint()?;
+            if id != 1 {
+                return Err(eyre!("Packet isn't a Ping Request(0x01), but {:#04x}", id));
+            }
+            let payload = packet.read_long()?;
+            let mut buf = Vec::with_capacity(1 + 8);
+            buf.write_varint(1).await?;
+            buf.write_u64(payload).await?;
+            connection.write_varint(buf.len() as i32).await?;
+            connection.write_all(&buf).await?;
+        }
+        netty::HandshakeType::Login => {
+            let _ = netty::read_packet(&mut connection, 128).await?;
+            let mut buf = vec![];
+            buf.write_varint(0).await?;
+            buf.write_string(include_str!("./disconnect_response_rate.json"))
                 .await?;
             connection.write_varint(buf.len() as i32).await?;
             connection.write_all(&buf).await?;

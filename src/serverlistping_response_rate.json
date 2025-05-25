@@ -1,0 +1,13 @@
+{
+    "version": {
+        "name": "e4mc",
+        "protocol": -1
+    },
+    "players": {
+        "max": 0,
+        "online": 0
+    },
+    "description": {
+        "text": "You are trying to connect too fast. Please wait a minute before retrying."
+    }
+}

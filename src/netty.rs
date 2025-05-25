@@ -87,7 +87,10 @@ pub trait ReadExt: Read {
     // }
 }
 
-pub async fn read_packet(mut reader: impl AsyncReadExt + Unpin, max_size: usize) -> Result<Vec<u8>, ReadError> {
+pub async fn read_packet(
+    mut reader: impl AsyncReadExt + Unpin,
+    max_size: usize,
+) -> Result<Vec<u8>, ReadError> {
     let len = read_varint(&mut reader).await?;
     if len < 0 || (len as usize) > max_size {
         return Err(if len == 254 {
@@ -101,7 +104,7 @@ pub async fn read_packet(mut reader: impl AsyncReadExt + Unpin, max_size: usize)
             }
         } else {
             ReadError::PacketTooLarge
-        })
+        });
     }
     let mut buf = vec![0u8; len as usize];
     if len == 254 {

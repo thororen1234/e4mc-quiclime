@@ -1,3 +1,5 @@
+use governor::DefaultKeyedRateLimiter;
+use governor::Quota;
 use log::info;
 use log::warn;
 use parking_lot::RwLock;
@@ -5,6 +7,7 @@ use quinn::RecvStream;
 use quinn::SendStream;
 use rand::prelude::*;
 use std::collections::HashMap;
+use std::net::IpAddr;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
@@ -18,10 +21,15 @@ type RouterCallback = oneshot::Sender<(SendStream, RecvStream)>;
 type RouteRequestReceiver = mpsc::UnboundedSender<RouterRequest>;
 
 #[allow(clippy::module_name_repetitions)]
-#[derive(Default)]
 pub struct RoutingTable {
     table: RwLock<HashMap<String, RouteRequestReceiver>>,
     base_domain: String,
+    limiter: DefaultKeyedRateLimiter<IpAddr>,
+}
+
+pub enum RoutingError {
+    InvalidDomain,
+    RateLimited,
 }
 
 impl RoutingTable {
@@ -29,6 +37,7 @@ impl RoutingTable {
         RoutingTable {
             table: RwLock::default(),
             base_domain,
+            limiter: DefaultKeyedRateLimiter::dashmap(Quota::per_minute(30.try_into().unwrap())),
         }
     }
 
@@ -44,14 +53,24 @@ impl RoutingTable {
         }
     }
 
-    pub async fn route(&self, domain: &str) -> Option<(SendStream, RecvStream)> {
+    pub async fn route_limited(
+        &self,
+        domain: &str,
+        ip: IpAddr,
+    ) -> Result<(SendStream, RecvStream), RoutingError> {
+        if self.limiter.check_key(&ip).is_err() {
+            return Err(RoutingError::RateLimited);
+        }
+        self.limiter.retain_recent();
         let (send, recv) = oneshot::channel();
         self.table
             .read()
-            .get(domain)?
+            .get(domain)
+            .ok_or(RoutingError::InvalidDomain)?
             .send(RouterRequest::RouteRequest(send))
-            .ok()?;
-        recv.await.ok()
+            .ok()
+            .ok_or(RoutingError::InvalidDomain)?;
+        recv.await.ok().ok_or(RoutingError::InvalidDomain)
     }
 
     fn random_domain(&self) -> String {
