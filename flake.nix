@@ -115,6 +115,36 @@
               example = "/path/to/key.pem";
               description = lib.mdDoc "Path to TLS key to use for quiclime connections.";
             };
+
+            clickhouseUrl = mkOption {
+              type = types.str;
+              example = "http://clickhouse:8123";
+              description = lib.mdDoc "Clickhouse URL to submit metrics to.";
+            };
+
+            clickhouseUser = mkOption {
+              type = types.str;
+              example = "quiclime";
+              description = lib.mdDoc "Clickhouse user.";
+            };
+
+            clickhousePasswordPath = mkOption {
+              type = types.str;
+              example = "/clickhouse_password";
+              description = lib.mdDoc "Path to file containing the Clickhouse user's password.";
+            };
+
+            clickhouseDatabase = mkOption {
+              type = types.str;
+              example = "default";
+              description = lib.mdDoc "Name of Clickhouse database.";
+            };
+
+            clickhouseTable = mkOption {
+              type = types.str;
+              example = "mc_connections";
+              description = lib.mdDoc "Name of Clickhouse table.";
+            };
           };
         };
 
@@ -141,6 +171,11 @@
               QUICLIME_BIND_ADDR_WEB = cfg.controlAddr;
               QUICLIME_CERT_PATH = cfg.cert;
               QUICLIME_KEY_PATH = cfg.key;
+              CLICKHOUSE_URL = cfg.clickhouseUrl;
+              CLICKHOUSE_USER = cfg.clickhouseUser;
+              CLICKHOUSE_PASSWORD_PATH = cfg.clickhousePasswordPath;
+              CLICKHOUSE_DB = cfg.clickhouseDatabase;
+              CLICKHOUSE_TABLE = cfg.clickhouseTable;
             };
           };
 

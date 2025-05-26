@@ -102,6 +102,10 @@ impl RoutingTable {
             parent: self,
         }
     }
+
+    pub fn base_domain(&self) -> &str {
+        &self.base_domain
+    }
 }
 
 #[allow(clippy::module_name_repetitions)]

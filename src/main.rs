@@ -2,21 +2,30 @@
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::cast_possible_wrap)]
 
-use std::{convert::Infallible, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    convert::Infallible,
+    net::{Ipv6Addr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
 use axum::{
     http::StatusCode,
     routing::{get, post},
 };
+use clickhouse::{inserter::Inserter, Row};
 use eyre::{eyre, Context};
 use log::{error, info, warn};
 use netty::{Handshake, ReadError};
+use parking_lot::Mutex;
 use quinn::{
     crypto::rustls::QuicServerConfig,
     rustls::pki_types::{CertificateDer, PrivateKeyDer},
     ConnectionError, Endpoint, Incoming, ServerConfig, TransportConfig,
 };
 use routing::{RoutingError, RoutingTable};
+use serde::Serialize;
+use time::OffsetDateTime;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -64,6 +73,16 @@ async fn create_server_config() -> eyre::Result<ServerConfig> {
     Ok(config)
 }
 
+#[derive(Row, Serialize)]
+struct Connection {
+    #[serde(with = "clickhouse::serde::time::datetime")]
+    established: OffsetDateTime,
+    region: &'static str,
+    client: Ipv6Addr,
+    intent: &'static str,
+    successful: bool,
+}
+
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
     env_logger::init();
@@ -78,11 +97,31 @@ async fn main() -> eyre::Result<()> {
     let routing_table = Box::leak(Box::new(routing::RoutingTable::new(
         std::env::var("QUICLIME_BASE_DOMAIN").context("Reading QUICLIME_BASE_DOMAIN")?,
     )));
+
+    let client = clickhouse::Client::default()
+        .with_url(std::env::var("CLICKHOUSE_URL").context("Reading CLICKHOUSE_URL")?)
+        .with_user(std::env::var("CLICKHOUSE_USER").context("Reading CLICKHOUSE_USER")?)
+        .with_password(
+            tokio::fs::read_to_string(
+                std::env::var("CLICKHOUSE_PASSWORD_PATH")
+                    .context("Reading CLICKHOUSE_PASSWORD_PATH")?,
+            )
+            .await
+            .context("Reading from CLICKHOUSE_PASSWORD_PATH")?,
+        )
+        .with_database(std::env::var("CLICKHOUSE_DB").context("Reading CLICKHOUSE_DB")?);
+    let inserter: clickhouse::inserter::Inserter<Connection> = client
+        .inserter(&std::env::var("CLICKHOUSE_TABLE").context("Reading CLICKHOUSE_TABLE")?)?
+        .with_timeouts(Some(Duration::from_secs(5)), Some(Duration::from_secs(20)))
+        .with_max_bytes(50_000_000)
+        .with_max_rows(750_000)
+        .with_period(Some(Duration::from_secs(15)));
+    let inserter = Arc::new(Mutex::new(inserter));
     #[allow(unreachable_code)]
     tokio::try_join!(
         listen_quic(endpoint, routing_table),
         listen_control(endpoint, routing_table),
-        listen_minecraft(routing_table)
+        listen_minecraft(routing_table, inserter)
     )?;
     Ok(())
 }
@@ -219,6 +258,7 @@ async fn listen_control(
 async fn try_handle_minecraft(
     mut connection: TcpStream,
     routing_table: &'static RoutingTable,
+    inserter: Arc<Mutex<Inserter<Connection>>>,
 ) -> eyre::Result<()> {
     let peer = connection.peer_addr()?;
     info!("Minecraft client connected from: {}", peer);
@@ -237,6 +277,21 @@ async fn try_handle_minecraft(
         match routing_table.route_limited(&address, peer.ip()).await {
             Ok(val) => val,
             Err(RoutingError::InvalidDomain) => {
+                if let Err(e) = inserter.lock().write(&Connection {
+                    established: OffsetDateTime::now_utc(),
+                    region: routing_table.base_domain(),
+                    client: match peer.ip() {
+                        std::net::IpAddr::V4(ipv4_addr) => ipv4_addr.to_ipv6_mapped(),
+                        std::net::IpAddr::V6(ipv6_addr) => ipv6_addr,
+                    },
+                    intent: match handshake.next_state {
+                        netty::HandshakeType::Status => "status",
+                        netty::HandshakeType::Login => "login",
+                    },
+                    successful: false,
+                }) {
+                    error!("Failed to send telemetry: {e:?}");
+                }
                 return politely_disconnect(connection, handshake).await;
             }
             Err(RoutingError::RateLimited) => {
@@ -244,6 +299,21 @@ async fn try_handle_minecraft(
                 return impolitely_disconnect(connection, handshake).await;
             }
         };
+    if let Err(e) = inserter.lock().write(&Connection {
+        established: OffsetDateTime::now_utc(),
+        region: routing_table.base_domain(),
+        client: match peer.ip() {
+            std::net::IpAddr::V4(ipv4_addr) => ipv4_addr.to_ipv6_mapped(),
+            std::net::IpAddr::V6(ipv6_addr) => ipv6_addr,
+        },
+        intent: match handshake.next_state {
+            netty::HandshakeType::Status => "status",
+            netty::HandshakeType::Login => "login",
+        },
+        successful: true,
+    }) {
+        error!("Failed to send telemetry: {e:?}");
+    }
     handshake.send(&mut send_host).await?;
     let (mut recv_client, mut send_client) = connection.split();
     tokio::select! {
@@ -349,13 +419,20 @@ async fn impolitely_disconnect(
     Ok(())
 }
 
-async fn handle_minecraft(connection: TcpStream, routing_table: &'static RoutingTable) {
-    if let Err(e) = try_handle_minecraft(connection, routing_table).await {
+async fn handle_minecraft(
+    connection: TcpStream,
+    routing_table: &'static RoutingTable,
+    inserter: Arc<Mutex<Inserter<Connection>>>,
+) {
+    if let Err(e) = try_handle_minecraft(connection, routing_table, inserter).await {
         error!("Error handling Minecraft connection: {:#}", e);
     };
 }
 
-async fn listen_minecraft(routing_table: &'static RoutingTable) -> eyre::Result<Infallible> {
+async fn listen_minecraft(
+    routing_table: &'static RoutingTable,
+    inserter: Arc<Mutex<Inserter<Connection>>>,
+) -> eyre::Result<Infallible> {
     let server = tokio::net::TcpListener::bind(
         std::env::var("QUICLIME_BIND_ADDR_MC")
             .context("Reading QUICLIME_BIND_ADDR_MC")?
@@ -365,7 +442,11 @@ async fn listen_minecraft(routing_table: &'static RoutingTable) -> eyre::Result<
     loop {
         match server.accept().await {
             Ok((connection, _)) => {
-                tokio::spawn(handle_minecraft(connection, routing_table));
+                tokio::spawn(handle_minecraft(
+                    connection,
+                    routing_table,
+                    inserter.clone(),
+                ));
             }
             Err(e) => {
                 error!("Error accepting minecraft connection: {:#}", e);
