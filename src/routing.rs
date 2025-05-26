@@ -27,11 +27,6 @@ pub struct RoutingTable {
     limiter: DefaultKeyedRateLimiter<IpAddr>,
 }
 
-pub enum RoutingError {
-    InvalidDomain,
-    RateLimited,
-}
-
 impl RoutingTable {
     pub fn new(base_domain: String) -> Self {
         RoutingTable {
@@ -53,24 +48,22 @@ impl RoutingTable {
         }
     }
 
-    pub async fn route_limited(
-        &self,
-        domain: &str,
-        ip: IpAddr,
-    ) -> Result<(SendStream, RecvStream), RoutingError> {
+    pub fn ratelimit(&self, ip: IpAddr) -> bool {
         if self.limiter.check_key(&ip).is_err() {
-            return Err(RoutingError::RateLimited);
+            return true;
         }
         self.limiter.retain_recent();
+        false
+    }
+
+    pub async fn route(&self, domain: &str) -> Option<(SendStream, RecvStream)> {
         let (send, recv) = oneshot::channel();
         self.table
             .read()
-            .get(domain)
-            .ok_or(RoutingError::InvalidDomain)?
+            .get(domain)?
             .send(RouterRequest::RouteRequest(send))
-            .ok()
-            .ok_or(RoutingError::InvalidDomain)?;
-        recv.await.ok().ok_or(RoutingError::InvalidDomain)
+            .ok()?;
+        recv.await.ok()
     }
 
     fn random_domain(&self) -> String {

@@ -22,7 +22,7 @@ use quinn::{
     rustls::pki_types::{CertificateDer, PrivateKeyDer},
     ConnectionError, Endpoint, Incoming, ServerConfig, TransportConfig,
 };
-use routing::{RoutingError, RoutingTable};
+use routing::RoutingTable;
 use serde::Serialize;
 use time::OffsetDateTime;
 use tokio::{
@@ -81,6 +81,7 @@ struct Connection {
     client: Ipv6Addr,
     intent: &'static str,
     successful: bool,
+    target: String,
 }
 
 #[tokio::main]
@@ -201,7 +202,7 @@ async fn try_handle_quic(connection: Incoming, routing_table: &RoutingTable) -> 
 async fn handle_quic(connection: Incoming, routing_table: &RoutingTable) {
     if let Err(e) = try_handle_quic(connection, routing_table).await {
         error!("Error handling QUIClime connection: {:#}", e);
-    };
+    }
     info!("Finished handling QUIClime connection");
 }
 
@@ -261,6 +262,7 @@ async fn try_handle_minecraft(
     routing_table: &'static RoutingTable,
     inserter: Arc<Mutex<Inserter<Connection>>>,
 ) -> eyre::Result<()> {
+    let established = OffsetDateTime::now_utc();
     let peer = connection.peer_addr()?;
     info!("Minecraft client connected from: {}", peer);
     let handshake = netty::read_packet(&mut connection, 512).await;
@@ -274,37 +276,14 @@ async fn try_handle_minecraft(
     let Some(address) = handshake.normalized_address() else {
         return politely_disconnect(connection, handshake).await;
     };
-    let (mut send_host, mut recv_host) =
-        match routing_table.route_limited(&address, peer.ip()).await {
-            Ok(val) => val,
-            Err(RoutingError::InvalidDomain) => {
-                tokio::task::spawn(async move {
-                    if let Err(e) = inserter.lock().await.write(&Connection {
-                        established: OffsetDateTime::now_utc(),
-                        region: routing_table.base_domain(),
-                        client: match peer.ip() {
-                            std::net::IpAddr::V4(ipv4_addr) => ipv4_addr.to_ipv6_mapped(),
-                            std::net::IpAddr::V6(ipv6_addr) => ipv6_addr,
-                        },
-                        intent: match handshake.next_state {
-                            netty::HandshakeType::Status => "status",
-                            netty::HandshakeType::Login => "login",
-                        },
-                        successful: false,
-                    }) {
-                        error!("Failed to send telemetry: {e:?}");
-                    }
-                });
-                return politely_disconnect(connection, handshake).await;
-            }
-            Err(RoutingError::RateLimited) => {
-                warn!("Connection from {} has been rate limited!", peer);
-                return impolitely_disconnect(connection, handshake).await;
-            }
-        };
+    if routing_table.ratelimit(peer.ip()) {
+        return impolitely_disconnect(connection, handshake).await;
+    }
+    let routing_result = routing_table.route(&address).await;
+    let routing_ok = routing_result.is_some();
     tokio::task::spawn(async move {
         if let Err(e) = inserter.lock().await.write(&Connection {
-            established: OffsetDateTime::now_utc(),
+            established,
             region: routing_table.base_domain(),
             client: match peer.ip() {
                 std::net::IpAddr::V4(ipv4_addr) => ipv4_addr.to_ipv6_mapped(),
@@ -314,11 +293,15 @@ async fn try_handle_minecraft(
                 netty::HandshakeType::Status => "status",
                 netty::HandshakeType::Login => "login",
             },
-            successful: true,
+            successful: routing_ok,
+            target: address
         }) {
             error!("Failed to send telemetry: {e:?}");
         }
     });
+    let Some((mut send_host, mut recv_host)) = routing_result else {
+        return politely_disconnect(connection, handshake).await;
+    };
     handshake.send(&mut send_host).await?;
     let (mut recv_client, mut send_client) = connection.split();
     tokio::select! {
@@ -431,7 +414,7 @@ async fn handle_minecraft(
 ) {
     if let Err(e) = try_handle_minecraft(connection, routing_table, inserter).await {
         error!("Error handling Minecraft connection: {:#}", e);
-    };
+    }
 }
 
 async fn listen_minecraft(
