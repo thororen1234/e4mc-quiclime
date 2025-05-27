@@ -3,6 +3,7 @@
 #![allow(clippy::cast_possible_wrap)]
 
 use std::{
+    collections::HashMap,
     convert::Infallible,
     net::{Ipv6Addr, SocketAddr},
     sync::Arc,
@@ -17,13 +18,14 @@ use clickhouse::{inserter::Inserter, Row};
 use eyre::{eyre, Context};
 use log::{error, info, warn};
 use netty::{Handshake, ReadError};
+use parking_lot::RwLock;
 use quinn::{
     crypto::rustls::QuicServerConfig,
     rustls::pki_types::{CertificateDer, PrivateKeyDer},
     ConnectionError, Endpoint, Incoming, ServerConfig, TransportConfig,
 };
 use routing::RoutingTable;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -80,7 +82,7 @@ struct Connection {
     region: &'static str,
     client: Ipv6Addr,
     intent: &'static str,
-    successful: bool,
+    outcome: &'static str,
     target: String,
 }
 
@@ -118,12 +120,14 @@ async fn main() -> eyre::Result<()> {
         .with_max_rows(750_000)
         .with_period(Some(Duration::from_secs(15)));
     let inserter = Arc::new(Mutex::new(inserter));
+    let blocklist = Arc::new(RwLock::new(HashMap::new()));
     #[allow(unreachable_code)]
     tokio::try_join!(
         listen_quic(endpoint, routing_table),
         listen_control(endpoint, routing_table),
-        listen_minecraft(routing_table, inserter.clone()),
-        send_commits(inserter)
+        listen_minecraft(routing_table, inserter.clone(), blocklist.clone()),
+        send_commits(inserter),
+        refresh_bl(blocklist)
     )?;
     Ok(())
 }
@@ -261,6 +265,7 @@ async fn try_handle_minecraft(
     mut connection: TcpStream,
     routing_table: &'static RoutingTable,
     inserter: Arc<Mutex<Inserter<Connection>>>,
+    blocklist: Arc<RwLock<HashMap<Ipv6Addr, BlocklistStatus>>>,
 ) -> eyre::Result<()> {
     let established = OffsetDateTime::now_utc();
     let peer = connection.peer_addr()?;
@@ -276,29 +281,73 @@ async fn try_handle_minecraft(
     let Some(address) = handshake.normalized_address() else {
         return politely_disconnect(connection, handshake).await;
     };
+
+    let target = address.clone();
+    let trace = |outcome| {
+        tokio::task::spawn(async move {
+            if let Err(e) = inserter.lock().await.write(&Connection {
+                established,
+                region: routing_table.base_domain(),
+                client: match peer.ip() {
+                    std::net::IpAddr::V4(ipv4_addr) => ipv4_addr.to_ipv6_mapped(),
+                    std::net::IpAddr::V6(ipv6_addr) => ipv6_addr,
+                },
+                intent: match handshake.next_state {
+                    netty::HandshakeType::Status => "status",
+                    netty::HandshakeType::Login => "login",
+                },
+                outcome,
+                target,
+            }) {
+                error!("Failed to send telemetry: {e:?}");
+            }
+        });
+    };
+
     if routing_table.ratelimit(peer.ip()) {
-        return impolitely_disconnect(connection, handshake).await;
+        trace("ratelimited");
+        return disconnect(
+            connection,
+            handshake,
+            include_str!("./serverlistping_response_rate.json"),
+            include_str!("./disconnect_response_rate.json"),
+        )
+        .await;
+    }
+    let bl_status = blocklist
+        .read()
+        .get(&match peer.ip() {
+            std::net::IpAddr::V4(ipv4_addr) => ipv4_addr.to_ipv6_mapped(),
+            std::net::IpAddr::V6(ipv6_addr) => ipv6_addr,
+        })
+        .copied();
+    if bl_status == Some(BlocklistStatus::ShadowBanned) {
+        trace("shadowbanned");
+        return politely_disconnect(connection, handshake).await;
+    } else if bl_status == Some(BlocklistStatus::Blocked) {
+        trace("blocked");
+        return disconnect(
+            connection,
+            handshake,
+            include_str!("./serverlistping_response_blocked.json"),
+            include_str!("./disconnect_response_blocked.json"),
+        )
+        .await;
+    } else if bl_status == Some(BlocklistStatus::PingMasked)
+        && handshake.next_state == netty::HandshakeType::Status
+    {
+        trace("ping_masked");
+        return disconnect(
+            connection,
+            handshake,
+            include_str!("./serverlistping_response_masked.json"),
+            include_str!("./disconnect_response_blocked.json"),
+        )
+        .await;
     }
     let routing_result = routing_table.route(&address).await;
     let routing_ok = routing_result.is_some();
-    tokio::task::spawn(async move {
-        if let Err(e) = inserter.lock().await.write(&Connection {
-            established,
-            region: routing_table.base_domain(),
-            client: match peer.ip() {
-                std::net::IpAddr::V4(ipv4_addr) => ipv4_addr.to_ipv6_mapped(),
-                std::net::IpAddr::V6(ipv6_addr) => ipv6_addr,
-            },
-            intent: match handshake.next_state {
-                netty::HandshakeType::Status => "status",
-                netty::HandshakeType::Login => "login",
-            },
-            successful: routing_ok,
-            target: address
-        }) {
-            error!("Failed to send telemetry: {e:?}");
-        }
-    });
+    trace(if routing_ok { "ok" } else { "bad_domain" });
     let Some((mut send_host, mut recv_host)) = routing_result else {
         return politely_disconnect(connection, handshake).await;
     };
@@ -316,53 +365,21 @@ async fn try_handle_minecraft(
     Ok(())
 }
 
-async fn politely_disconnect(mut connection: TcpStream, handshake: Handshake) -> eyre::Result<()> {
-    match handshake.next_state {
-        netty::HandshakeType::Status => {
-            let packet = netty::read_packet(&mut connection, 1).await?;
-            let mut packet = packet.as_slice();
-            let id = packet.read_varint()?;
-            if id != 0 {
-                return Err(eyre!(
-                    "Packet isn't a Status Request(0x00), but {:#04x}",
-                    id
-                ));
-            }
-            let mut buf = vec![];
-            buf.write_varint(0).await?;
-            buf.write_string(include_str!("./serverlistping_response.json"))
-                .await?;
-            connection.write_varint(buf.len() as i32).await?;
-            connection.write_all(&buf).await?;
-            let packet = netty::read_packet(&mut connection, 9).await?;
-            let mut packet = packet.as_slice();
-            let id = packet.read_varint()?;
-            if id != 1 {
-                return Err(eyre!("Packet isn't a Ping Request(0x01), but {:#04x}", id));
-            }
-            let payload = packet.read_long()?;
-            let mut buf = Vec::with_capacity(1 + 8);
-            buf.write_varint(1).await?;
-            buf.write_u64(payload).await?;
-            connection.write_varint(buf.len() as i32).await?;
-            connection.write_all(&buf).await?;
-        }
-        netty::HandshakeType::Login => {
-            let _ = netty::read_packet(&mut connection, 128).await?;
-            let mut buf = vec![];
-            buf.write_varint(0).await?;
-            buf.write_string(include_str!("./disconnect_response.json"))
-                .await?;
-            connection.write_varint(buf.len() as i32).await?;
-            connection.write_all(&buf).await?;
-        }
-    }
-    Ok(())
+async fn politely_disconnect(connection: TcpStream, handshake: Handshake) -> eyre::Result<()> {
+    disconnect(
+        connection,
+        handshake,
+        include_str!("./serverlistping_response.json"),
+        include_str!("./disconnect_response.json"),
+    )
+    .await
 }
 
-async fn impolitely_disconnect(
+async fn disconnect(
     mut connection: TcpStream,
     handshake: Handshake,
+    slp_resp: &str,
+    dc_resp: &str,
 ) -> eyre::Result<()> {
     match handshake.next_state {
         netty::HandshakeType::Status => {
@@ -377,8 +394,7 @@ async fn impolitely_disconnect(
             }
             let mut buf = vec![];
             buf.write_varint(0).await?;
-            buf.write_string(include_str!("./serverlistping_response_rate.json"))
-                .await?;
+            buf.write_string(slp_resp).await?;
             connection.write_varint(buf.len() as i32).await?;
             connection.write_all(&buf).await?;
             let packet = netty::read_packet(&mut connection, 9).await?;
@@ -398,8 +414,7 @@ async fn impolitely_disconnect(
             let _ = netty::read_packet(&mut connection, 128).await?;
             let mut buf = vec![];
             buf.write_varint(0).await?;
-            buf.write_string(include_str!("./disconnect_response_rate.json"))
-                .await?;
+            buf.write_string(dc_resp).await?;
             connection.write_varint(buf.len() as i32).await?;
             connection.write_all(&buf).await?;
         }
@@ -411,8 +426,9 @@ async fn handle_minecraft(
     connection: TcpStream,
     routing_table: &'static RoutingTable,
     inserter: Arc<Mutex<Inserter<Connection>>>,
+    blocklist: Arc<RwLock<HashMap<Ipv6Addr, BlocklistStatus>>>,
 ) {
-    if let Err(e) = try_handle_minecraft(connection, routing_table, inserter).await {
+    if let Err(e) = try_handle_minecraft(connection, routing_table, inserter, blocklist).await {
         error!("Error handling Minecraft connection: {:#}", e);
     }
 }
@@ -420,6 +436,7 @@ async fn handle_minecraft(
 async fn listen_minecraft(
     routing_table: &'static RoutingTable,
     inserter: Arc<Mutex<Inserter<Connection>>>,
+    blocklist: Arc<RwLock<HashMap<Ipv6Addr, BlocklistStatus>>>,
 ) -> eyre::Result<Infallible> {
     let server = tokio::net::TcpListener::bind(
         std::env::var("QUICLIME_BIND_ADDR_MC")
@@ -434,6 +451,7 @@ async fn listen_minecraft(
                     connection,
                     routing_table,
                     inserter.clone(),
+                    blocklist.clone(),
                 ));
             }
             Err(e) => {
@@ -449,5 +467,31 @@ async fn send_commits(inserter: Arc<Mutex<Inserter<Connection>>>) -> eyre::Resul
             error!("Error committing: {e:?}");
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq)]
+enum BlocklistStatus {
+    ShadowBanned,
+    Blocked,
+    PingMasked,
+}
+
+async fn refresh_bl(
+    blocklist: Arc<RwLock<HashMap<Ipv6Addr, BlocklistStatus>>>,
+) -> eyre::Result<Infallible> {
+    let client = reqwest::Client::new();
+    let url = std::env::var("BLOCKLIST_URL").context("Reading BLOCKLIST_URL")?;
+    loop {
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let Ok(resp) = client.get(&url).send().await else {
+            error!("Failed to fetch blocklist!");
+            continue;
+        };
+        let Ok(json) = resp.json::<HashMap<Ipv6Addr, BlocklistStatus>>().await else {
+            error!("Failed to fetch blocklist!");
+            continue;
+        };
+        *blocklist.write() = json;
     }
 }

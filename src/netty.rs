@@ -165,7 +165,7 @@ pub struct Handshake {
     pub next_state: HandshakeType,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
 pub enum HandshakeType {
     Status = 1,

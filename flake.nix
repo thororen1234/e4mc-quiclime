@@ -145,6 +145,12 @@
               example = "mc_connections";
               description = lib.mdDoc "Name of Clickhouse table.";
             };
+
+            blocklistUrl = mkOption {
+              type = types.str;
+              example = "http://blocklists/blocklist.json";
+              description = lib.mdDoc "URL of IP blocklist.";
+            };
           };
         };
 
@@ -176,6 +182,7 @@
               CLICKHOUSE_PASSWORD_PATH = cfg.clickhousePasswordPath;
               CLICKHOUSE_DB = cfg.clickhouseDatabase;
               CLICKHOUSE_TABLE = cfg.clickhouseTable;
+              BLOCKLIST_URL = cfg.blocklistUrl;
             };
           };
 
