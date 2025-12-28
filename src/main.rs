@@ -11,6 +11,7 @@ use std::{
 };
 
 use axum::{
+    extract::Path,
     http::StatusCode,
     routing::{get, post},
 };
@@ -22,7 +23,7 @@ use parking_lot::RwLock;
 use quinn::{
     crypto::rustls::QuicServerConfig,
     rustls::pki_types::{CertificateDer, PrivateKeyDer},
-    ConnectionError, Endpoint, Incoming, ServerConfig, TransportConfig,
+    ConnectionError, Endpoint, Incoming, ServerConfig, TransportConfig, VarInt,
 };
 use routing::RoutingTable;
 use serde::{Deserialize, Serialize};
@@ -34,8 +35,9 @@ use tokio::{
 };
 
 use crate::{
-    netty::{ReadExt, WriteExt},
+    netty::{read_varint, ReadExt, WriteExt},
     proto::{ClientboundControlMessage, ServerboundControlMessage},
+    routing::RouterRequest,
 };
 
 mod netty;
@@ -140,25 +142,49 @@ async fn try_handle_quic(connection: Incoming, routing_table: &RoutingTable) -> 
     );
     let (mut send_control, mut recv_control) = connection.accept_bi().await?;
     info!("Control channel open: {}", connection.remote_address());
-    let mut handle = loop {
-        let mut buf = vec![0u8; recv_control.read_u8().await? as _];
+
+    let mut dialtone_ticket = None;
+
+    let (mut handle, sender) = loop {
+        let len = read_varint(&mut recv_control).await?;
+        if !(0..=8192).contains(&len) {
+            connection.close(VarInt::from_u32(0), &[]);
+            return Ok(());
+        }
+        let mut buf = vec![0u8; len as usize];
         recv_control.read_exact(&mut buf).await?;
         if let Ok(parsed) = serde_json::from_slice(&buf) {
             match parsed {
+                ServerboundControlMessage::ProbeCapabilities => {
+                    let response =
+                        serde_json::to_vec(&ClientboundControlMessage::HasCapabilities {
+                            caps: vec!["dialtone_sidecar".to_string()],
+                        })?;
+                    send_control.write_all(&[response.len() as u8]).await?;
+                    send_control.write_all(&response).await?;
+                    continue;
+                }
                 ServerboundControlMessage::RequestDomainAssignment => {
                     let handle = routing_table.register();
                     info!(
                         "Domain assigned to {}: {}",
                         connection.remote_address(),
-                        handle.domain()
+                        handle.0.domain()
                     );
                     let response =
                         serde_json::to_vec(&ClientboundControlMessage::DomainAssignmentComplete {
-                            domain: handle.domain().to_string(),
+                            domain: handle.0.domain().to_string(),
                         })?;
                     send_control.write_all(&[response.len() as u8]).await?;
                     send_control.write_all(&response).await?;
                     break handle;
+                }
+                ServerboundControlMessage::DialtoneRegisterTicket { ticket } => {
+                    dialtone_ticket = Some(ticket);
+                    let response =
+                        serde_json::to_vec(&ClientboundControlMessage::TicketRegistered)?;
+                    send_control.write_all(&[response.len() as u8]).await?;
+                    send_control.write_all(&response).await?;
                 }
             }
         }
@@ -195,10 +221,43 @@ async fn try_handle_quic(connection: Incoming, routing_table: &RoutingTable) -> 
                             })?;
                         send_control.write_all(&[response.len() as u8]).await?;
                         send_control.write_all(&response).await?;
+                    },
+                    routing::RouterRequest::ServerboundControlMessage(message) => {
+                        match message {
+                            ServerboundControlMessage::DialtoneRegisterTicket { ticket } => {
+                                info!("registering ticket {ticket:?}");
+                                dialtone_ticket = Some(ticket);
+                                let response = serde_json::to_vec(&ClientboundControlMessage::TicketRegistered)?;
+                                send_control.write_all(&[response.len() as u8]).await?;
+                                send_control.write_all(&response).await?;
+                            },
+                            _ => {
+                                let response = serde_json::to_vec(&ClientboundControlMessage::UnknownMessage)?;
+                                send_control.write_all(&[response.len() as u8]).await?;
+                                send_control.write_all(&response).await?;
+                            }
+                        }
+                    },
+                    routing::RouterRequest::TicketRequest(callback) => {
+                        _ = callback.send(dialtone_ticket.clone());
                     }
                 }
             }
             Ok(())
+        } => r,
+        r = async {
+            loop {
+                let len = read_varint(&mut recv_control).await?;
+                if !(0..=8192).contains(&len) {
+                    connection.close(VarInt::from_u32(0), &[]);
+                    return Ok(());
+                }
+                let mut buf = vec![0u8; len as usize];
+                recv_control.read_exact(&mut buf).await?;
+                if let Ok(parsed) = serde_json::from_slice(&buf) {
+                    sender.send(RouterRequest::ServerboundControlMessage(parsed))?;
+                }
+            }
         } => r
     }
 }
@@ -225,6 +284,18 @@ async fn listen_control(
     routing_table: &'static RoutingTable,
 ) -> eyre::Result<Infallible> {
     let app = axum::Router::new()
+        .route(
+            "/.well-known/dialtone_ticket/:domain",
+            get(async |Path(addr): Path<String>| {
+                let Some(addr) = unicode_madness::validate_and_normalize_domain(&addr) else {
+                    return (StatusCode::NOT_FOUND, String::new());
+                };
+                match routing_table.check_ticket(&addr).await {
+                    Some(ticket) => (StatusCode::OK, ticket),
+                    None => (StatusCode::NOT_FOUND, String::new()),
+                }
+            }),
+        )
         .route(
             "/metrics",
             get(|| async { format!("host_count {}", routing_table.size()) }),
