@@ -122,7 +122,7 @@ pub async fn read_packet(
     Ok(buf)
 }
 
-async fn read_varint(mut reader: impl AsyncReadExt + Unpin) -> Result<i32, ReadError> {
+pub async fn read_varint(mut reader: impl AsyncReadExt + Unpin) -> Result<i32, ReadError> {
     let mut res = 0i32;
     for i in 0..5 {
         let part = reader.read_u8().await?;

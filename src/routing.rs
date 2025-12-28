@@ -11,13 +11,18 @@ use std::net::IpAddr;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
+use crate::proto::ServerboundControlMessage;
+
 #[derive(Debug)]
 pub enum RouterRequest {
     RouteRequest(RouterCallback),
     BroadcastRequest(String),
+    ServerboundControlMessage(ServerboundControlMessage),
+    TicketRequest(TicketCallback),
 }
 
 type RouterCallback = oneshot::Sender<(SendStream, RecvStream)>;
+type TicketCallback = oneshot::Sender<Option<String>>;
 type RouteRequestReceiver = mpsc::UnboundedSender<RouterRequest>;
 
 #[allow(clippy::module_name_repetitions)]
@@ -82,7 +87,7 @@ impl RoutingTable {
         )
     }
 
-    pub fn register(&self) -> RoutingHandle {
+    pub fn register(&self) -> (RoutingHandle, RouteRequestReceiver) {
         let mut lock = self.table.write();
         let mut domain = self.random_domain();
         while lock.contains_key(&domain) {
@@ -95,12 +100,25 @@ impl RoutingTable {
         domain = crate::unicode_madness::validate_and_normalize_domain(&domain)
             .expect("Resulting domain is not valid");
         let (send, recv) = mpsc::unbounded_channel();
-        lock.insert(domain.clone(), send);
-        RoutingHandle {
-            recv,
-            domain,
-            parent: self,
-        }
+        lock.insert(domain.clone(), send.clone());
+        (
+            RoutingHandle {
+                recv,
+                domain,
+                parent: self,
+            },
+            send,
+        )
+    }
+
+    pub async fn check_ticket(&self, domain: &str) -> Option<String> {
+        let (send, recv) = oneshot::channel();
+        self.table
+            .read()
+            .get(domain)?
+            .send(RouterRequest::TicketRequest(send))
+            .ok()?;
+        recv.await.ok()?
     }
 }
 
