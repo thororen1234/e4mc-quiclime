@@ -54,7 +54,7 @@ impl RoutingTable {
     }
 
     pub fn ratelimit(&self, ip: IpAddr) -> bool {
-        if self.limiter.check_key(&ip).is_err() {
+        if self.limiter.check_key(&ip.to_canonical()).is_err() {
             return true;
         }
         self.limiter.retain_recent();
