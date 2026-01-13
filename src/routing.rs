@@ -63,7 +63,7 @@ impl RoutingTable {
         domain: &str,
         ip: IpAddr,
     ) -> Result<(SendStream, RecvStream), RoutingError> {
-        if self.limiter.check_key(&ip).is_err() {
+        if self.limiter.check_key(&ip.to_canonical()).is_err() {
             return Err(RoutingError::RateLimited);
         }
         self.limiter.retain_recent();
@@ -111,7 +111,11 @@ impl RoutingTable {
         )
     }
 
-    pub async fn check_ticket(&self, domain: &str) -> Option<String> {
+    pub async fn check_ticket(&self, domain: &str, ip: IpAddr) -> Option<String> {
+        if self.limiter.check_key(&ip.to_canonical()).is_err() {
+            return None;
+        }
+        self.limiter.retain_recent();
         let (send, recv) = oneshot::channel();
         self.table
             .read()

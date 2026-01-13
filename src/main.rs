@@ -9,22 +9,24 @@ use axum::{
     http::StatusCode,
     routing::{get, post},
 };
-use eyre::{eyre, Context};
+use axum_client_ip::RightmostXForwardedFor;
+use eyre::{Context, eyre};
 use log::{error, info, warn};
 use netty::{Handshake, ReadError};
 use quinn::{
+    ConnectionError, Endpoint, Incoming, ServerConfig, TransportConfig, VarInt,
     crypto::rustls::QuicServerConfig,
     rustls::pki_types::{CertificateDer, PrivateKeyDer},
-    ConnectionError, Endpoint, Incoming, ServerConfig, TransportConfig, VarInt,
 };
 use routing::{RoutingError, RoutingTable};
+use rustls_pki_types::pem::PemObject;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
 };
 
 use crate::{
-    netty::{read_varint, ReadExt, WriteExt},
+    netty::{ReadExt, WriteExt, read_varint},
     proto::{ClientboundControlMessage, ServerboundControlMessage},
     routing::RouterRequest,
 };
@@ -39,13 +41,12 @@ fn get_certs() -> eyre::Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'sta
     let mut cert_file = std::io::BufReader::new(std::fs::File::open(
         std::env::var("QUICLIME_CERT_PATH").context("Reading QUICLIME_CERT_PATH")?,
     )?);
-    let certs = rustls_pemfile::certs(&mut cert_file)
+    let certs = rustls_pki_types::pem::ReadIter::new(&mut cert_file)
         .filter_map(Result::ok)
         .collect();
-    let mut key_file = std::io::BufReader::new(std::fs::File::open(
+    let key = PrivateKeyDer::from_pem_file(
         std::env::var("QUICLIME_KEY_PATH").context("Reading QUICLIME_KEY_PATH")?,
-    )?);
-    let key = rustls_pemfile::private_key(&mut key_file)?.ok_or(eyre!("No private key?"))?;
+    )?;
     Ok((certs, key))
 }
 
@@ -240,50 +241,46 @@ async fn listen_control(
 ) -> eyre::Result<Infallible> {
     let app = axum::Router::new()
         .route(
-            "/.well-known/dialtone_ticket/:domain",
-            get(async |Path(addr): Path<String>| {
-                let Some(addr) = unicode_madness::validate_and_normalize_domain(&addr) else {
-                    return (StatusCode::NOT_FOUND, String::new());
-                };
-                match routing_table.check_ticket(&addr).await {
-                    Some(ticket) => (StatusCode::OK, ticket),
-                    None => (StatusCode::NOT_FOUND, String::new()),
-                }
-            }),
+            "/.well-known/dialtone_ticket/{domain}",
+            get(
+                async |Path(addr): Path<String>, RightmostXForwardedFor(ip)| {
+                    let Some(addr) = unicode_madness::validate_and_normalize_domain(&addr) else {
+                        return (StatusCode::NOT_FOUND, String::new());
+                    };
+                    match routing_table.check_ticket(&addr, ip).await {
+                        Some(ticket) => (StatusCode::OK, ticket),
+                        None => (StatusCode::NOT_FOUND, String::new()),
+                    }
+                },
+            ),
         )
         .route(
             "/metrics",
-            get(|| async { format!("host_count {}", routing_table.size()) }),
+            get(async || format!("host_count {}", routing_table.size())),
         )
         .route(
             "/reload-certs",
-            post(|| async {
-                match create_server_config().await {
-                    Ok(config) => {
-                        endpoint.set_server_config(Some(config));
-                        (StatusCode::OK, "Success".to_string())
-                    }
-                    Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
+            post(async || match create_server_config().await {
+                Ok(config) => {
+                    endpoint.set_server_config(Some(config));
+                    (StatusCode::OK, "Success".to_string())
                 }
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
             }),
         )
         .route(
             "/broadcast",
-            post(move |body: String| async move { routing_table.broadcast(&body) }),
+            post(async move |body: String| routing_table.broadcast(&body)),
         )
         .route(
             "/stop",
-            post(|| async {
-                endpoint.close(0u32.into(), b"e4mc closing");
-            }),
+            post(async || endpoint.close(0u32.into(), b"e4mc closing")),
         );
-    axum::Server::bind(
-        &std::env::var("QUICLIME_BIND_ADDR_WEB")
-            .context("Reading QUICLIME_BIND_ADDR_WEB")?
-            .parse()?,
+    let listener = tokio::net::TcpListener::bind(
+        std::env::var("QUICLIME_BIND_ADDR_WEB").context("Reading QUICLIME_BIND_ADDR_WEB")?,
     )
-    .serve(app.into_make_service())
     .await?;
+    axum::serve(listener, app).await?;
     Err(eyre!("control endpoint closed"))
 }
 
